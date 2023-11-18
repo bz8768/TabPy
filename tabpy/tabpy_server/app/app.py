@@ -6,10 +6,18 @@ import os
 import shutil
 import signal
 import sys
+import _thread
+
+import tornado
+from tornado.http1connection import HTTP1Connection
+
 import tabpy
+import tabpy.tabpy_server.app.arrow_server as pa
 from tabpy.tabpy import __version__
 from tabpy.tabpy_server.app.app_parameters import ConfigParameters, SettingsParameters
 from tabpy.tabpy_server.app.util import parse_pwd_file
+from tabpy.tabpy_server.handlers.basic_auth_server_middleware_factory import BasicAuthServerMiddlewareFactory
+from tabpy.tabpy_server.handlers.no_op_auth_handler import NoOpAuthHandler
 from tabpy.tabpy_server.management.state import TabPyState
 from tabpy.tabpy_server.management.util import _get_state_from_file
 from tabpy.tabpy_server.psws.callbacks import init_model_evaluator, init_ps_server
@@ -24,11 +32,8 @@ from tabpy.tabpy_server.handlers import (
     StatusHandler,
     UploadDestinationHandler,
 )
-import tornado
-
 
 logger = logging.getLogger(__name__)
-
 
 def _init_asyncio_patch():
     """
@@ -59,8 +64,11 @@ class TabPyApp:
     tabpy_state = None
     python_service = None
     credentials = {}
+    arrow_server = None
+    max_request_size = None
 
-    def __init__(self, config_file):
+    def __init__(self, config_file, disable_auth_warning=True):
+        self.disable_auth_warning = disable_auth_warning
         if config_file is None:
             config_file = os.path.join(
                 os.path.dirname(__file__), os.path.pardir, "common", "default.conf"
@@ -75,13 +83,45 @@ class TabPyApp:
 
         self._parse_config(config_file)
 
+    def _get_tls_certificates(self, config):
+        tls_certificates = []
+        cert = config[SettingsParameters.CertificateFile]
+        key = config[SettingsParameters.KeyFile]
+        with open(cert, "rb") as cert_file:
+            tls_cert_chain = cert_file.read()
+        with open(key, "rb") as key_file:
+            tls_private_key = key_file.read()
+        tls_certificates.append((tls_cert_chain, tls_private_key))
+        return tls_certificates
+    
+    def _get_arrow_server(self, config):
+        verify_client = None
+        tls_certificates = None
+        scheme = "grpc+tcp"
+        if config[SettingsParameters.TransferProtocol] == "https":
+            scheme = "grpc+tls"
+            tls_certificates = self._get_tls_certificates(config)
+
+        host = "0.0.0.0"
+        port = config.get(SettingsParameters.ArrowFlightPort)
+        location = "{}://{}:{}".format(scheme, host, port)
+
+        auth_middleware = None
+        if "authentication" in config[SettingsParameters.ApiVersions]["v1"]["features"]:
+            _, creds = parse_pwd_file(config[ConfigParameters.TABPY_PWD_FILE])
+            auth_middleware = {
+                "basic": BasicAuthServerMiddlewareFactory(creds)
+            }
+
+        server = pa.FlightServer(host, location,
+                            tls_certificates=tls_certificates,
+                            verify_client=verify_client, auth_handler=NoOpAuthHandler(),
+                            middleware=auth_middleware)
+        return server
+
     def run(self):
         application = self._create_tornado_web_app()
-        max_request_size = (
-            int(self.settings[SettingsParameters.MaxRequestSizeInMb]) * 1024 * 1024
-        )
-        logger.info(f"Setting max request size to {max_request_size} bytes")
-
+        
         init_model_evaluator(self.settings, self.tabpy_state, self.python_service)
 
         protocol = self.settings[SettingsParameters.TransferProtocol]
@@ -99,18 +139,30 @@ class TabPyApp:
         settings = {}
         if self.settings[SettingsParameters.GzipEnabled] is True:
             settings["decompress_request"] = True
+
         application.listen(
             self.settings[SettingsParameters.Port],
             ssl_options=ssl_options,
-            max_buffer_size=max_request_size,
-            max_body_size=max_request_size,
+            max_buffer_size=self.max_request_size,
+            max_body_size=self.max_request_size,
             **settings,
-        )
+        ) 
 
         logger.info(
             "Web service listening on port "
             f"{str(self.settings[SettingsParameters.Port])}"
         )
+
+        if self.settings[SettingsParameters.ArrowEnabled]:
+            def start_pyarrow():
+                self.arrow_server = self._get_arrow_server(self.settings)
+                pa.start(self.arrow_server)
+
+            try:
+                _thread.start_new_thread(start_pyarrow, ())
+            except Exception as e:
+                logger.critical(f"Failed to start PyArrow server: {e}")
+
         tornado.ioloop.IOLoop.instance().start()
 
     def _create_tornado_web_app(self):
@@ -287,6 +339,8 @@ class TabPyApp:
              100, None),
             (SettingsParameters.GzipEnabled, ConfigParameters.TABPY_GZIP_ENABLE,
              True, parser.getboolean),
+            (SettingsParameters.ArrowEnabled, ConfigParameters.TABPY_ARROW_ENABLE, False, parser.getboolean), 
+            (SettingsParameters.ArrowFlightPort, ConfigParameters.TABPY_ARROWFLIGHT_PORT, 13622, parser.getint),
         ]
 
         for setting, parameter, default_val, parse_function in settings_parameters:
@@ -301,6 +355,12 @@ class TabPyApp:
         ].lower()
 
         self._validate_transfer_protocol_settings()
+        
+        # Set max request size in bytes
+        self.max_request_size = (
+            int(self.settings[SettingsParameters.MaxRequestSizeInMb]) * 1024 * 1024
+        )
+        logger.info(f"Setting max request size to {self.max_request_size} bytes")
 
         # if state.ini does not exist try and create it - remove
         # last dependence on batch/shell script
@@ -335,9 +395,7 @@ class TabPyApp:
                 logger.critical(msg)
                 raise RuntimeError(msg)
         else:
-            logger.info(
-                "Password file is not specified: " "Authentication is not enabled"
-            )
+            self._handle_configuration_without_authentication()
 
         features = self._get_features()
         self.settings[SettingsParameters.ApiVersions] = {"v1": {"features": features}}
@@ -412,6 +470,31 @@ class TabPyApp:
 
         return succeeded
 
+    def _handle_configuration_without_authentication(self):
+        std_no_auth_msg = "Password file is not specified: Authentication is not enabled"
+
+        if self.disable_auth_warning == True:
+            logger.info(std_no_auth_msg)
+            return  
+
+        confirm_no_auth_msg = "\nWARNING: This TabPy server is not currently configured for username/password authentication. "
+
+        if self.settings[SettingsParameters.EvaluateEnabled]:
+            confirm_no_auth_msg += ("This means that, because the TABPY_EVALUATE_ENABLE feature is enabled, there is " 
+                "the potential that unauthenticated individuals may be able to remotely execute code on this machine. ")
+
+        confirm_no_auth_msg += ("We strongly advise against proceeding without authentication as it poses a significant security risk.\n\n"
+            "Do you wish to proceed without authentication? (y/N): ")
+
+        confirm_no_auth_input = input(confirm_no_auth_msg)
+
+        if confirm_no_auth_input == 'y':
+            logger.info(std_no_auth_msg)
+        else:
+            print("\nAborting start up. To enable authentication for your TabPy server, see "
+                "https://github.com/tableau/TabPy/blob/master/docs/server-config.md#authentication.")
+            exit()
+
     def _get_features(self):
         features = {}
 
@@ -424,6 +507,7 @@ class TabPyApp:
 
         features["evaluate_enabled"] = self.settings[SettingsParameters.EvaluateEnabled]
         features["gzip_enabled"] = self.settings[SettingsParameters.GzipEnabled]
+        features["arrow_enabled"] = self.settings[SettingsParameters.ArrowEnabled]
         return features
 
     def _build_tabpy_state(self):
@@ -443,3 +527,16 @@ class TabPyApp:
         logger.info(f"Loading state from state file {state_file_path}")
         tabpy_state = _get_state_from_file(state_file_dir)
         return tabpy_state, TabPyState(config=tabpy_state, settings=self.settings)
+
+
+# Override _read_body to allow content with size exceeding max_body_size
+# This enables proper handling of 413 errors in base_handler
+def _read_body_allow_max_size(self, code, headers, delegate):
+    if "Content-Length" in headers:
+        content_length = int(headers["Content-Length"])
+        if content_length > self._max_body_size:
+            return
+    return self.original_read_body(code, headers, delegate)
+
+HTTP1Connection.original_read_body = HTTP1Connection._read_body
+HTTP1Connection._read_body = _read_body_allow_max_size

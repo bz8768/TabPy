@@ -1,5 +1,33 @@
 # Changelog
 
+## v2.9.0
+
+### Improvements
+
+- Require confirmation to continue when starting TabPy without authentication, 
+  with a warning that this is an insecure state and not recommended.
+
+## v2.8.0
+
+### Improvements
+
+- Returns 413 error code when request payload exceeds 
+TABPY_MAX_REQUEST_SIZE_MB config setting.
+
+## v2.7.0
+
+### Improvements
+
+- Adds support for data streaming in Arrow columnar format via Apache
+Arrow Flight.
+
+## v2.6.0
+
+### Improvements
+
+- Fixes deprecation of sklearn in favor of current package name
+scikit-learn
+
 ## v2.5.1
 
 ### Improvements

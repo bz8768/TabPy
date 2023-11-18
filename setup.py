@@ -85,11 +85,12 @@ def setup_package():
             "requests",
             "scipy",
             "simplejson",
-            "sklearn",
+            "scikit-learn",
             "textblob",
             "tornado",
             "twisted",
             "urllib3",
+            "pyarrow",
         ],
         entry_points={
             "console_scripts": [
